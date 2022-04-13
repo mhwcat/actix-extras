@@ -171,16 +171,18 @@ where
         let service = Rc::clone(&self.service);
 
         async move {
-            let (req, credentials) = match Extract::<T>::new(req).await {
-                Ok(req) => req,
+            let (mut req, credentials) = match Extract::<T>::new(req).await {
+                Ok((req, cred)) => (req, cred),
                 Err((err, req)) => {
                     return Ok(req.error_response(err).map_into_right_body());
                 }
             };
 
-            // TODO: alter to remove ? operator; an error response is required for downstream
-            // middleware to do their thing (eg. cors adding headers)
-            let req = process_fn(req, credentials).await?;
+            let req_cloned = ServiceRequest::from_request(req.parts_mut().0.clone());
+            let req = match process_fn(req, credentials).await {
+                Ok(req) => req,
+                Err(err) => return Ok(req_cloned.error_response(err).map_into_right_body()),
+            };
 
             service.call(req).await.map(|res| res.map_into_left_body())
         }
@@ -239,15 +241,49 @@ where
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use actix_service::{into_service, Service};
     use actix_web::error::ErrorForbidden;
     use actix_web::http::StatusCode;
     use actix_web::test::TestRequest;
     use actix_web::{error, web, App, HttpResponse};
-
-    use super::*;
     use crate::extractors::basic::BasicAuth;
     use crate::extractors::bearer::BearerAuth;
+    use actix_service::{Transform};
+    use actix_web::http::{header::*};
+    use actix_web::test::{ok_service};
+
+    #[actix_web::test]
+    async fn test_middleware_basic() {
+        let mw = HttpAuthentication::basic(|req, cred| async move {
+            match cred.user_id() {
+                id if id == "test_id" => Ok(req),
+                _ => Err(error::ErrorUnauthorized("")),
+            }
+        })
+        .new_transform(ok_service())
+        .await
+        .unwrap();
+
+        let req = TestRequest::default();
+        let resp = mw.call(req.to_srv_request()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(resp.headers().get(WWW_AUTHENTICATE).unwrap(), "Basic");
+
+        let req = TestRequest::default()
+            .insert_header(("Authorization", "Basic YTo=" /* Wrong ID */));
+        let resp = mw.call(req.to_srv_request()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert!(resp.headers().get(WWW_AUTHENTICATE).is_none());
+
+        let req = TestRequest::default().insert_header((
+            "Authorization",
+            "Basic dGVzdF9pZDo=", /* ID for "test_id" */
+        ));
+        let resp = mw.call(req.to_srv_request()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp.headers().get(WWW_AUTHENTICATE).is_none());
+    }
 
     /// This is a test for https://github.com/actix/actix-extras/issues/10
     #[actix_web::test]
